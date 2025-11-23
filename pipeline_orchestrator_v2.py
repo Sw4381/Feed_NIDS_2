@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FEED-NIDS Pipeline Orchestrator v2 (수정)
+FEED-NIDS Pipeline Orchestrator v2 (FAISS 통합 + 동적 Feedback 로드)
 실행 흐름:
-  Detection → Prioritizer → (선택) Train KB → (선택) Feedback → 최종 결과
+  Detection → Prioritizer → Train KB (FAISS) → Feedback (FAISS, 동적 증축) → 최종 결과
 """
 
 import sys
@@ -20,9 +20,10 @@ from tools.base import get_logger, ToolResult
 from tools.detection import DetectionTool
 from tools.prioritizer import PrioritizerTool
 from tools.auto_feedback import AutoFeedbackTool
-from tools.similarity_apply import SimilarityApplyTool  # 기존 Feedback용
 from tools.kb_similarity_apply_tool_optimized import KBSimilarityApplyToolOptimized
 from tools.knowledge_base import KnowledgeBase
+from tools.feedback_base import FeedbackBase
+from tools.similarity_apply_faiss import SimilarityApplyToolFAISS
 from tools.merge import MergeTool
 
 
@@ -50,7 +51,7 @@ def list_rounds_from_inputs(det_in_dir: str):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="FEED-NIDS v2: Detection → Prioritizer → (Train KB) → (Feedback)"
+        description="FEED-NIDS v2: Detection → Prioritizer → Train KB (FAISS) → Feedback (FAISS)"
     )
     
     # 실행 모드
@@ -73,6 +74,7 @@ def main():
     ap.add_argument("--train-cases-dir", default="./tools/Train_Cases", help="Train KB 위치")
     ap.add_argument("--model-path", default="./models/xgboost_binary_classifier.joblib")
     ap.add_argument("--det-out", default="./round_results")
+    ap.add_argument("--kb-applied-dir", default="./kb_applied_round_predictions", help="KB 적용 결과")
 
     # Detection (0단계)
     ap.add_argument("--skip-detection", action="store_true", help="Detection 스킵")
@@ -83,14 +85,13 @@ def main():
     ap.add_argument("--kb-alpha", type=float, default=0.3, help="KB IP 가중치")
     ap.add_argument("--kb-beta", type=float, default=0.4, help="KB Cosine 가중치")
     ap.add_argument("--kb-gamma", type=float, default=0.3, help="KB SHAP 가중치")
-    ap.add_argument("--kb-threshold", type=float, default=0.6, help="KB 유사도 임계값")
+    ap.add_argument("--kb-threshold", type=float, default=0.9, help="KB 유사도 임계값")
     ap.add_argument("--kb-no-direction", action="store_true", help="KB 방향 무시")
     ap.add_argument("--kb-top-k", type=int, default=5, help="KB SHAP Top-K")
-
-    # 👇 새로 추가
     ap.add_argument("--kb-no-faiss", action="store_true", help="FAISS 비활성화 (기본 Brute-Force 사용)")
     ap.add_argument("--kb-faiss-k", type=int, default=100, help="FAISS Stage 1 후보 개수")
     ap.add_argument("--kb-cache-dir", default="./cache", help="FAISS 캐시 디렉토리")
+    ap.add_argument("--kb-use-gpu", action="store_true", help="KB FAISS GPU 사용")
     
     # Phase 2: Gating 파라미터
     ap.add_argument("--gate-alpha", type=float, default=0.3, help="Gating: 공격 확률")
@@ -104,13 +105,20 @@ def main():
     ap.add_argument("--auto-top-n", type=int, default=300)
     ap.add_argument("--auto-percent", type=float, default=None)
 
-    # Phase 2: Similarity Apply (Feedback)
+    # Phase 3: Feedback Base (FAISS)
+    ap.add_argument("--fb-no-faiss", action="store_true", help="Feedback FAISS 비활성화")
+    ap.add_argument("--fb-cache-dir", default="./cache", help="Feedback FAISS 캐시 디렉토리")
+    ap.add_argument("--fb-use-gpu", action="store_true", help="Feedback FAISS GPU 사용")
+    ap.add_argument("--fb-no-auto-rebuild", action="store_true", help="자동 재구축 비활성화")
+
+    # Phase 3: Similarity Apply (Feedback)
     ap.add_argument("--alpha", type=float, default=0.3, help="Feedback IP 가중치")
     ap.add_argument("--beta", type=float, default=0.4, help="Feedback Cosine 가중치")
     ap.add_argument("--gamma", type=float, default=0.3, help="Feedback SHAP 가중치")
-    ap.add_argument("--threshold", type=float, default=0.6, help="Feedback 임계값")
+    ap.add_argument("--threshold", type=float, default=0.8, help="Feedback 임계값")
     ap.add_argument("--no-direction", action="store_true")
     ap.add_argument("--top-k", type=int, default=5)
+    ap.add_argument("--faiss-k", type=int, default=900, help="Feedback FAISS Stage 1 후보")
 
     # 라운드별 스킵
     ap.add_argument("--skip-feedback-rounds", nargs="*", default=[])
@@ -155,7 +163,7 @@ def main():
             return
         log.info("✅ Phase 0: Detection 완료")
     else:
-        log.info("⏭️ Phase 0: Detection 스킵")
+        log.info("⭐️ Phase 0: Detection 스킵")
 
     log.info("")
 
@@ -189,86 +197,89 @@ def main():
 
     # ===== Phase 2️⃣: Train Knowledge Base 적용 (선택사항) =====
     if args.mode in ["full", "kb-only"]:
-        log.info("Phase 2️⃣: Train Knowledge Base 적용 (선택사항)")
+        log.info("Phase 2️⃣: Train Knowledge Base 적용")
         log.info("-" * 60)
 
-    # pipeline_orchestrator_v2.py (line 189-220 수정)
-    # KB 로드 (FAISS 자동 구축)
-    kb = KnowledgeBase(
-        train_cases_dir=args.train_cases_dir,
-        use_faiss=not args.kb_no_faiss,  # 👈 FAISS 사용 여부
-        cache_dir=args.kb_cache_dir,      # 👈 캐시 디렉토리
-        index_type="IVF",                 # 👈 인덱스 타입
-        n_clusters=100,
-        use_gpu=False
-    )
+        # KB 로드 (FAISS 자동 구축)
+        kb = KnowledgeBase(
+            train_cases_dir=args.train_cases_dir,
+            use_faiss=not args.kb_no_faiss,
+            cache_dir=args.kb_cache_dir,
+            index_type="IVF",
+            n_clusters=100,
+            use_gpu=args.kb_use_gpu
+        )
 
-    if kb.load():
-        stats = kb.get_stats()
-        log.info(f"✅ Knowledge Base 로드: {stats}")
-        kb_corpus = kb.kb_df.copy()
-    else:
-        log.warning("⚠️ Knowledge Base 로드 실패 → Phase 2 스킵")
-        kb_corpus = None
-        kb = None
+        if kb.load():
+            stats = kb.get_stats()
+            log.info(f"✅ Knowledge Base 로드: {stats}")
+            kb_corpus = kb.kb_df.copy()
+        else:
+            log.warning("⚠️ Knowledge Base 로드 실패 → Phase 2 스킵")
+            kb_corpus = None
+            kb = None
 
-    # 모든 라운드에 KB 적용 (FAISS 최적화)
-    kb_results = {}
-    if kb_corpus is not None:
-        for rn in rounds:
-            log.info(f"[{rn}] KB 적용 시작")
-            # ✅ 최적화 버전 사용
-            kb_tool = KBSimilarityApplyToolOptimized(
-                round_name=rn,
-                pred_dir=args.pred_dir,
-                kb_corpus=kb.kb_df.copy(),  # DataFrame
-                kb_instance=kb,              # ✅ FAISS 인덱스 전달!
-                out_dir="./kb_applied",
-                alpha=args.kb_alpha,
-                beta=args.kb_beta,
-                gamma=args.kb_gamma,
-                threshold=args.kb_threshold,
-                direction_sensitive=not args.kb_no_direction,
-                top_k=args.kb_top_k,
-                faiss_k=args.kb_faiss_k,
-            ).run()
-        
-            kb_results[rn] = kb_tool
-            if kb_tool.ok:
-                mode = kb_tool.data.get("mode", "Unknown")
-                applied = kb_tool.data.get("applied", 0)
-                total = kb_tool.data.get("total", 0)
-                log.info(f"✅ [{rn}] KB 적용 완료 ({mode}): {applied}/{total}")
-            else:
-                log.warning(f"⚠️ [{rn}] KB: {kb_tool.message}")
+        # 모든 라운드에 KB 적용 (FAISS 최적화)
+        kb_results = {}
+        if kb_corpus is not None:
+            for rn in rounds:
+                log.info(f"[{rn}] KB 적용 시작")
+                
+                kb_tool = KBSimilarityApplyToolOptimized(
+                    round_name=rn,
+                    pred_dir=args.feedback_dir,
+                    kb_corpus=kb.kb_df.copy(),
+                    kb_instance=kb,
+                    out_dir=args.kb_applied_dir,
+                    alpha=args.kb_alpha,
+                    beta=args.kb_beta,
+                    gamma=args.kb_gamma,
+                    threshold=args.kb_threshold,
+                    direction_sensitive=not args.kb_no_direction,
+                    top_k=args.kb_top_k,
+                    faiss_k=args.kb_faiss_k,
+                ).run()
+            
+                kb_results[rn] = kb_tool
+                if kb_tool.ok:
+                    mode = kb_tool.data.get("mode", "Unknown")
+                    applied = kb_tool.data.get("applied", 0)
+                    total = kb_tool.data.get("total", 0)
+                    log.info(f"✅ [{rn}] KB 적용 완료 ({mode}): {applied}/{total}")
+                else:
+                    log.warning(f"⚠️ [{rn}] KB: {kb_tool.message}")
 
-    log.info("✅ Phase 2: Train KB 완료")
-    log.info("")
-
-    # kb-only 모드면 여기서 종료
-    if args.mode == "kb-only":
-        log.info("=" * 60)
-        log.info("🎉 kb-only 모드 완료!")
-        log.info("=" * 60)
-        return
-    else:
-        log.info("⏭️ Phase 2: Train KB 스킵 (--mode feedback-only)")
+        log.info("✅ Phase 2: Train KB 완료")
         log.info("")
 
-    # ===== Phase 3️⃣: Feedback 적용 (선택사항) =====
+        # kb-only 모드면 여기서 종료
+        if args.mode == "kb-only":
+            log.info("=" * 60)
+            log.info("🎉 kb-only 모드 완료!")
+            log.info("=" * 60)
+            return
+    else:
+        log.info("⭐️ Phase 2: Train KB 스킵 (--mode feedback-only)")
+        log.info("")
+        kb = None
+
+    # ===== Phase 3️⃣: Feedback Base 로드 및 적용 (선택사항, 동적 로드) =====
     if args.mode in ["full", "feedback-only"]:
-        log.info("Phase 3️⃣: Feedback 적용 (선택사항)")
+        log.info("Phase 3️⃣: Feedback Base 로드 및 적용 (동적 증축)")
         log.info("-" * 60)
 
         if args.skip_feedback_round1:
             args.skip_feedback_rounds = list(set(args.skip_feedback_rounds + ["Round_1"]))
         skip_set = set(args.skip_feedback_rounds)
 
+        # 🔥 Feedback Base를 각 라운드마다 동적으로 로드
+        feedback_base = None
+        
         for rn in rounds:
             log.info(f"[{rn}] Feedback 처리 시작")
 
             # 자동 피드백
-            if not args.skip_auto_feedback and prioritizer_results[rn].ok:
+            if not args.skip_auto_feedback and prioritizer_results.get(rn) and prioritizer_results[rn].ok:
                 log.info(f"  └─ AutoFeedback")
                 af = AutoFeedbackTool(
                     round_name=rn,
@@ -278,17 +289,48 @@ def main():
                 ).run()
                 if af.ok:
                     log.info(f"    ✅ AutoFeedback 완료")
+                    
+                    # 🔥 AutoFeedback 후 FeedbackBase 재로드 (자동 증축)
+                    log.info(f"  └─ FeedbackBase 재로드 (AutoFeedback 반영)")
+                    feedback_base = FeedbackBase(
+                        feedback_dir=args.feedback_dir,
+                        use_faiss=not args.fb_no_faiss,
+                        cache_dir=args.fb_cache_dir,
+                        index_type="IVF",
+                        n_clusters=100,
+                        use_gpu=args.fb_use_gpu,
+                        auto_rebuild=not args.fb_no_auto_rebuild,
+                    )
+                    
+                    if feedback_base.load(force_rebuild=True):
+                        fb_stats = feedback_base.get_stats()
+                        log.info(f"    ✅ Feedback Base 재로드 완료: {fb_stats}")
+                    else:
+                        log.warning(f"    ⚠️ Feedback Base 재로드 실패")
+                        feedback_base = None
                 else:
                     log.warning(f"    ⚠️ AutoFeedback: {af.message}")
 
-            # 유사도 적용
+            # 🔥 Round_1은 피드백 적용 스킵 (코퍼스 구축 단계)
+            if rn == "Round_1":
+                log.info(f"  └─ Round_1: 피드백 코퍼스 구축 단계 → SimilarityApply 스킵")
+                log.info(f"✅ [{rn}] Feedback 처리 완료 (코퍼스 구축)")
+                continue
+
+            # 유사도 적용 (FAISS)
             if rn in skip_set:
                 log.info(f"  └─ SimilarityApply 스킵")
             else:
-                log.info(f"  └─ SimilarityApply")
-                sa = SimilarityApplyTool(
+                log.info(f"  └─ SimilarityApply (FAISS)")
+                
+                if feedback_base is None:
+                    log.warning(f"    ⚠️ Feedback Base 없음 → 스킵")
+                    continue
+                
+                sa = SimilarityApplyToolFAISS(
                     round_name=rn,
-                    feedback_dir=args.feedback_dir,
+                    kb_applied_dir=args.kb_applied_dir,
+                    feedback_base=feedback_base,
                     out_dir=args.applied_dir,
                     alpha=args.alpha,
                     beta=args.beta,
@@ -296,6 +338,7 @@ def main():
                     threshold=args.threshold,
                     direction_sensitive=not args.no_direction,
                     top_k=args.top_k,
+                    faiss_k=args.faiss_k,
                 ).run()
                 
                 if sa.ok:
@@ -323,7 +366,7 @@ def main():
         log.info("")
 
     else:
-        log.info("⏭️ Phase 3: Feedback 스킵 (--mode kb-only)")
+        log.info("⭐️ Phase 3: Feedback 스킵 (--mode kb-only)")
         log.info("")
 
     log.info("=" * 60)
